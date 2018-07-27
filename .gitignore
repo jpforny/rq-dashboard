@@ -5,4 +5,5 @@ dump.rdb
 /dist
 /build
 /.direnv
+.idea/
 ._*

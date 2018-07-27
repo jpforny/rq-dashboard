@@ -16,18 +16,15 @@ As a quick-and-dirty convenience, the command line invocation in ``cli.py``
 provides the option to require HTTP Basic Auth in a few lines of code.
 
 """
-from functools import wraps
 from math import ceil
 
-import arrow
+from flask import Blueprint, current_app, render_template, url_for
 from redis import Redis, from_url
-from redis.sentinel import Sentinel
 from rq import (Queue, Worker, cancel_job, get_failed_queue, pop_connection,
                 push_connection, requeue_job)
-from rq.job import Job
-from six import string_types
 
-from flask import Blueprint, current_app, render_template, url_for
+from .utils import (jsonify, remove_none_values, pagination_window,
+                    serialize_queues, serialize_job)
 
 blueprint = Blueprint(
     'rq_dashboard',
@@ -40,20 +37,8 @@ blueprint = Blueprint(
 @blueprint.before_app_first_request
 def setup_rq_connection():
     redis_url = current_app.config.get('REDIS_URL')
-    redis_sentinels = current_app.config.get('REDIS_SENTINELS')
-    if isinstance(redis_url, list):
-        current_app.redis_conn = from_url(redis_url[0])
-    elif isinstance(redis_url, string_types):
+    if redis_url:
         current_app.redis_conn = from_url(redis_url)
-    elif redis_sentinels:
-        redis_master = current_app.config.get('REDIS_MASTER_NAME')
-        password = current_app.config.get('REDIS_PASSWORD')
-        db = current_app.config.get('REDIS_DB')
-        sentinel_hosts = [tuple(sentinel.split(':', 1))
-                          for sentinel in redis_sentinels.split(',')]
-
-        sentinel = Sentinel(sentinel_hosts, db=db, password=password)
-        current_app.redis_conn = sentinel.master_for(redis_master)
     else:
         current_app.redis_conn = Redis(
             host=current_app.config.get('REDIS_HOST'),
@@ -71,69 +56,6 @@ def push_rq_connection():
 @blueprint.teardown_request
 def pop_rq_connection(exception=None):
     pop_connection()
-
-
-def jsonify(f):
-    @wraps(f)
-    def _wrapped(*args, **kwargs):
-        from flask import jsonify as flask_jsonify
-        try:
-            result_dict = f(*args, **kwargs)
-        except Exception as e:
-            result_dict = dict(status='error')
-            if current_app.config['DEBUG']:
-                result_dict['reason'] = str(e)
-                from traceback import format_exc
-                result_dict['exc_info'] = format_exc()
-        return flask_jsonify(**result_dict)
-
-    return _wrapped
-
-
-def serialize_queues(queues):
-    return [
-        dict(
-            name=q.name,
-            count=q.count,
-            url=url_for('.overview', queue_name=q.name))
-        for q in queues
-    ]
-
-
-def serialize_date(dt):
-    if dt is None:
-        return None
-    return arrow.get(dt).to('UTC').datetime.isoformat()
-
-
-def serialize_job(job):
-    return dict(
-        id=job.id,
-        created_at=serialize_date(job.created_at),
-        enqueued_at=serialize_date(job.enqueued_at),
-        ended_at=serialize_date(job.ended_at),
-        origin=job.origin,
-        result=job._result,
-        exc_info=str(job.exc_info) if job.exc_info else None,
-        description=job.description)
-
-
-def remove_none_values(input_dict):
-    return dict(((k, v) for k, v in input_dict.items() if v is not None))
-
-
-def pagination_window(total_items, cur_page, per_page=5, window_size=10):
-    all_pages = range(1, int(ceil(total_items / float(per_page))) + 1)
-    result = all_pages
-    if window_size >= 1:
-        temp = min(
-            len(all_pages) - window_size,
-            (cur_page - 1) - int(ceil(window_size / 2.0))
-        )
-        pages_window_start = max(0, temp)
-        pages_window_end = pages_window_start + window_size
-        result = all_pages[pages_window_start:pages_window_end]
-    return result
 
 
 @blueprint.route('/', defaults={'queue_name': None, 'page': '1'})
@@ -163,10 +85,7 @@ def overview(queue_name, page):
 @blueprint.route('/job/<job_id>/cancel', methods=['POST'])
 @jsonify
 def cancel_job_view(job_id):
-    if current_app.config.get('DELETE_JOBS'):
-        Job.fetch(job_id).delete()
-    else:
-        cancel_job(job_id)
+    cancel_job(job_id)
     return dict(status='OK')
 
 
@@ -204,26 +123,6 @@ def compact_queue(queue_name):
     return dict(status='OK')
 
 
-@blueprint.route('/rq-instance/<instance_number>', methods=['POST'])
-@jsonify
-def change_rq_instance(instance_number):
-    redis_url = current_app.config.get('REDIS_URL')
-    if not isinstance(redis_url, list):
-        return dict(status='Single RQ. Not Permitted.')
-    if int(instance_number) >= len(redis_url):
-        raise LookupError('Index exceeds RQ list. Not Permitted.')
-    pop_connection()
-    current_app.redis_conn = from_url(redis_url[int(instance_number)])
-    push_rq_connection()
-    return dict(status='OK')
-
-
-@blueprint.route('/rq-instances.json')
-@jsonify
-def list_instances():
-    return dict(rq_instances=current_app.config.get('REDIS_URL'))
-
-
 @blueprint.route('/queues.json')
 @jsonify
 def list_queues():
@@ -236,7 +135,7 @@ def list_queues():
 def list_jobs(queue_name, page):
     current_page = int(page)
     queue = Queue(queue_name)
-    per_page = 10
+    per_page = 5
     total_items = queue.count
     pages_numbers_in_window = pagination_window(
         total_items, current_page, per_page)
@@ -269,16 +168,6 @@ def list_jobs(queue_name, page):
     return dict(name=queue.name, jobs=jobs, pagination=pagination)
 
 
-def serialize_current_job(job):
-    if job is None:
-        return "idle"
-    return dict(
-        job_id=job.id,
-        description=job.description,
-        created_at=serialize_date(job.created_at)
-    )
-
-
 @blueprint.route('/workers.json')
 @jsonify
 def list_workers():
@@ -289,9 +178,7 @@ def list_workers():
         dict(
             name=worker.name,
             queues=serialize_queue_names(worker),
-            state=str(worker.get_state()),
-            current_job=serialize_current_job(
-                worker.get_current_job()),
+            state=worker.get_state()
         )
         for worker in Worker.all()
     ]
